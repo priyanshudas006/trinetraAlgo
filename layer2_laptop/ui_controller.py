@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import tkinter as tk
+import time
+import threading
 from tkinter import filedialog, messagebox
 
 import cv2
@@ -19,6 +21,11 @@ class UIController:
         self.state_var = tk.StringVar(value="State: IDLE")
         self.mode_var = tk.StringVar(value="target")
         self.info_var = tk.StringVar(value="No map loaded")
+        self._live_camera = False
+        self._camera_thread = None
+        self._latest_camera_frame = None
+        self._camera_lock = threading.Lock()
+        self._camera_error_count = 0
 
         self._build_layout()
         self.main.set_ui_state_callback(self.update_state)
@@ -41,6 +48,8 @@ class UIController:
         add_btn("Start Mission", self.start_mission)
         add_btn("Stop Mission", self.stop_mission)
         add_btn("Refresh Camera", self.refresh_camera)
+        add_btn("Start Live Camera", self.start_live_camera)
+        add_btn("Stop Live Camera", self.stop_live_camera)
 
         tk.Label(sidebar, textvariable=self.state_var, bg="#1d1f22", fg="#9bd67d", wraplength=250, justify="left").pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(sidebar, textvariable=self.info_var, bg="#1d1f22", fg="#e5e5e5", wraplength=250, justify="left").pack(fill="x", padx=14)
@@ -94,6 +103,46 @@ class UIController:
             self.info_var.set("Camera unavailable")
             return
         self.show_image(frame)
+        self.info_var.set("Camera frame refreshed")
+
+    def start_live_camera(self) -> None:
+        if self._live_camera:
+            self.info_var.set("Live camera already running")
+            return
+        self._live_camera = True
+        self._camera_error_count = 0
+        self._camera_thread = threading.Thread(target=self._camera_worker, daemon=True)
+        self._camera_thread.start()
+        self._schedule_live_render()
+        self.info_var.set("Live camera started")
+
+    def stop_live_camera(self) -> None:
+        self._live_camera = False
+        self.info_var.set("Live camera stopped")
+
+    def _camera_worker(self) -> None:
+        while self._live_camera:
+            frame = self.main.get_camera_frame()
+            if frame is None:
+                self._camera_error_count += 1
+                time.sleep(0.15)
+                continue
+            with self._camera_lock:
+                self._latest_camera_frame = frame
+            time.sleep(0.03)
+
+    def _schedule_live_render(self) -> None:
+        if not self._live_camera:
+            return
+        frame = None
+        with self._camera_lock:
+            if self._latest_camera_frame is not None:
+                frame = self._latest_camera_frame.copy()
+        if frame is not None:
+            self.show_image(frame)
+        elif self._camera_error_count > 20:
+            self.info_var.set("Live camera unstable/unavailable")
+        self.root.after(90, self._schedule_live_render)
 
     def show_image(self, frame) -> None:
         if frame is None:
@@ -106,4 +155,9 @@ class UIController:
         self.map_panel.image = tk_img
 
     def start(self) -> None:
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
+
+    def _on_close(self) -> None:
+        self._live_camera = False
+        self.root.destroy()

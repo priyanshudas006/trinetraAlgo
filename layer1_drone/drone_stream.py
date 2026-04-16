@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,6 +15,15 @@ try:
     import pytesseract
 except Exception:  # pragma: no cover - optional dependency for OCR
     pytesseract = None
+
+if pytesseract is not None:
+    for candidate in (
+        Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+        Path("C:/Program Files/Tesseract/tesseract.exe"),
+    ):
+        if candidate.exists():
+            pytesseract.pytesseract.tesseract_cmd = str(candidate)
+            break
 
 
 @dataclass

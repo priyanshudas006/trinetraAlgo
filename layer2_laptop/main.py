@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import sys
 import threading
+import time
 from typing import Callable, List, Optional, Tuple
 
 import cv2
@@ -290,7 +292,31 @@ class TrinetraSystem:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="TRINETRA laptop orchestrator")
+    parser.add_argument("--headless", action="store_true", help="Run a non-UI smoke mission and exit")
+    parser.add_argument("--headless-seconds", type=float, default=5.0, help="Headless mission runtime before stop")
+    args = parser.parse_args()
+
     system = TrinetraSystem()
+
+    if args.headless:
+        ok, msg = system.load_drone_snapshot(force_refresh=True)
+        print(f"[HEADLESS] load_drone_snapshot: ok={ok} msg='{msg}'")
+        if not ok:
+            raise SystemExit(1)
+
+        system.set_mode("surveillance")
+        ok, msg = system.start_mission()
+        print(f"[HEADLESS] start_mission: ok={ok} msg='{msg}'")
+        if not ok:
+            raise SystemExit(1)
+
+        time.sleep(max(1.0, args.headless_seconds))
+        state = system._nav.state.value if system._nav else "UNKNOWN"
+        system.stop_mission()
+        print(f"[HEADLESS] stop_mission: state='{state}'")
+        return
+
     ui = UIController(system)
     ui.start()
 
