@@ -24,10 +24,10 @@ try:
     from .model1_surveillance.path_planner import PathPlanner
     from .model1_surveillance.terrain_detector import TerrainDetector
     from .navigation_controller import MissionState, NavigationController
+    from .map_visualizer import MapVisualizer
     from .rover_api import RoverAPI
     from .ui_controller import UIController
     from .utils.config import (
-        BACKEND_HAZARD_URL,
         DRONE_OCR_EVERY_N_FRAMES,
         DRONE_OCR_INTERVAL_SECONDS,
         DRONE_DEFAULT_ALT,
@@ -51,10 +51,10 @@ except ImportError:
     from model1_surveillance.path_planner import PathPlanner
     from model1_surveillance.terrain_detector import TerrainDetector
     from navigation_controller import MissionState, NavigationController
+    from map_visualizer import MapVisualizer
     from rover_api import RoverAPI
     from ui_controller import UIController
     from utils.config import (
-        BACKEND_HAZARD_URL,
         DRONE_OCR_EVERY_N_FRAMES,
         DRONE_OCR_INTERVAL_SECONDS,
         DRONE_DEFAULT_ALT,
@@ -107,6 +107,7 @@ class TrinetraSystem:
         self.terrain_detector = TerrainDetector()
         self.grid_builder = GridHeuristics(grid_size=self.grid_size, obstacle_inflation_px=12)
         self.boundary_extractor = BoundaryExtractor(grid_size=self.grid_size)
+        self.map_visualizer = MapVisualizer()
         self.drone_autodetect_max_sources = DRONE_AUTODETECT_MAX_SOURCES
         self.drone_osd_keywords = [k.strip() for k in DRONE_OSD_KEYWORDS.split(",") if k.strip()]
 
@@ -159,6 +160,9 @@ class TrinetraSystem:
                     mapper.calculate(node)
 
             self.selected_target = None
+            self.map_visualizer.set_base_image(image)
+            self.map_visualizer.set_grid(self.grid)
+            self.map_visualizer.start()
             source = "SIMULATION" if DRONE_SIMULATION else "WEBCAM"
             active = self.drone.get_active_source()
             return True, f"Drone snapshot loaded and map processed ({source}, source={active})"
@@ -314,7 +318,10 @@ class TrinetraSystem:
             boundary = self.boundary_extractor.extract(self.grid)
             ordered = self.boundary_extractor.order_nodes(boundary)
             if not ordered:
-                return False, "No surveillance boundary path available"
+                traversable = [n for row in self.grid for n in row if n["status"] in ("SAFE", "PARTIAL")]
+                if not traversable:
+                    return False, "No surveillance boundary path available"
+                ordered = traversable
             self._planner.build_path(ordered)
             mission_target = ordered[-1]
             enable_vision = False
@@ -338,12 +345,13 @@ class TrinetraSystem:
         self._nav = NavigationController(
             planner=self._planner,
             rover_api=self.rover_api,
-            backend_url=BACKEND_HAZARD_URL,
+            backend_url="",
             gps_tolerance_m=3.5,
             vision_switch_m=6.0,
             vision_conf_threshold=0.55,
             camera_interval_s=0.6,
             enable_vision=enable_vision,
+            map_visualizer=self.map_visualizer,
             state_cb=self._emit_state,
         )
 

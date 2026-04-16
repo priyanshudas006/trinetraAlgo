@@ -11,6 +11,17 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 import requests
+import logging
+try:
+    from .utils.debug import debug_log
+except ImportError:
+    try:
+        from layer2_laptop.utils.debug import debug_log
+    except ImportError:
+        from utils.debug import debug_log
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -161,53 +172,68 @@ class RoverAPI:
         self._state_failures = 0
         self._sensor_failures = 0
         self._command_failures = 0
+        self._request_retries = 2
 
     def get_state(self) -> dict:
         if self.simulation and self.sim is not None:
             return self.sim.get_state()
-        try:
-            response = requests.get(f"{self.ip}/state", timeout=self.timeout_s)
-            response.raise_for_status()
-            payload = response.json()
+        payload = self._request_json("GET", "/state")
+        if payload is not None:
             self._last_state = {
                 "lat": self._coerce_float(payload, ("lat", "latitude"), self._last_state["lat"]),
                 "lon": self._coerce_float(payload, ("lon", "lng", "longitude"), self._last_state["lon"]),
                 "heading": self._coerce_float(payload, ("heading", "yaw", "hdg"), self._last_state["heading"]),
             }
             self._state_failures = 0
-        except Exception:
+        else:
             self._state_failures += 1
         return dict(self._last_state)
 
     def send_command(self, cmd: str) -> bool:
         if cmd not in ("FORWARD", "LEFT", "RIGHT", "STOP"):
+            debug_log("ERROR", f"ESP32 failed: invalid command '{cmd}'")
             return False
+        debug_log("ESP32", f"Sending command: {cmd}")
         if self.simulation and self.sim is not None:
             self.sim.send_command(cmd)
+            debug_log("ESP32", "Response: 200 (simulation)")
             return True
-        try:
-            response = requests.post(f"{self.ip}/command", json={"cmd": cmd, "command": cmd}, timeout=self.timeout_s)
-            ok = response.status_code < 300
-            self._command_failures = 0 if ok else (self._command_failures + 1)
-            return ok
-        except Exception:
-            self._command_failures += 1
-            return False
+        payload = {"cmd": cmd, "command": cmd}
+        for _ in range(self._request_retries + 1):
+            try:
+                response = requests.post(f"{self.ip}/command", json=payload, timeout=self.timeout_s)
+                debug_log("ESP32", f"Response: {response.status_code}")
+                if response.status_code < 300:
+                    self._command_failures = 0
+                    return True
+            except Exception as error:
+                debug_log("ERROR", f"ESP32 failed: {error}")
+            time.sleep(0.05)
+        self._command_failures += 1
+        if self._command_failures >= 4 and cmd != "STOP":
+            # Best-effort failsafe stop after repeated command send failures.
+            try:
+                requests.post(f"{self.ip}/command", json={"cmd": "STOP", "command": "STOP"}, timeout=self.timeout_s)
+            except Exception as error:
+                debug_log("ERROR", f"ESP32 failed: {error}")
+                LOGGER.warning("Failed to send failsafe STOP to rover")
+        return False
 
     def get_sensor(self) -> dict:
         if self.simulation and self.sim is not None:
-            return self.sim.get_sensor()
-        try:
-            response = requests.get(f"{self.ip}/sensor", timeout=self.timeout_s)
-            response.raise_for_status()
-            payload = response.json()
+            sensor = self.sim.get_sensor()
+            debug_log("SENSOR", f"Gas={sensor.get('gas', 0.0)}, Metal={sensor.get('metal', 0.0)}")
+            return sensor
+        payload = self._request_json("GET", "/sensor")
+        if payload is not None:
             self._last_sensor = {
                 "metal": self._coerce_float(payload, ("metal", "metal_value", "metalValue"), self._last_sensor["metal"]),
                 "gas": self._coerce_float(payload, ("gas", "mq2", "gas_value", "gasValue"), self._last_sensor["gas"]),
                 "obstacle": self._coerce_bool(payload, ("obstacle", "obstacle_detected", "hasObstacle"), self._last_sensor["obstacle"]),
             }
             self._sensor_failures = 0
-        except Exception:
+            debug_log("SENSOR", f"Gas={self._last_sensor['gas']}, Metal={self._last_sensor['metal']}")
+        else:
             self._sensor_failures += 1
         return dict(self._last_sensor)
 
@@ -254,9 +280,6 @@ class RoverAPI:
             self._camera_cap = None
 
     def _read_stream_frame(self, url: str) -> Optional[np.ndarray]:
-        if self._camera_cap is not None and str(self._camera_cap.getBackendName() if hasattr(self._camera_cap, "getBackendName") else ""):
-            # keep existing capture if URL unchanged
-            pass
         if getattr(self, "_camera_cap_url", None) != url and self._camera_cap is not None:
             self._camera_cap.release()
             self._camera_cap = None
@@ -354,3 +377,17 @@ class RoverAPI:
                 seen.add(u)
                 uniq.append(u)
         return uniq
+
+    def _request_json(self, method: str, path: str) -> Optional[dict]:
+        url = f"{self.ip}{path}"
+        for _ in range(self._request_retries + 1):
+            try:
+                if method == "GET":
+                    response = requests.get(url, timeout=self.timeout_s)
+                else:
+                    response = requests.request(method, url, timeout=self.timeout_s)
+                response.raise_for_status()
+                return response.json()
+            except Exception:
+                time.sleep(0.05)
+        return None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import logging
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
@@ -24,6 +25,8 @@ if pytesseract is not None:
         if candidate.exists():
             pytesseract.pytesseract.tesseract_cmd = str(candidate)
             break
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,6 +72,7 @@ class DroneStream:
         self.fallback_altitude = float(fallback_altitude)
         self.allow_source_fallback = bool(allow_source_fallback)
         self.blocked_sources = set(int(s) for s in (blocked_sources or []))
+        self._last_ocr_warn_ts = 0.0
 
     def capture_snapshot(self) -> Dict[str, Any]:
         """Returns {lat, lon, altitude, pitch, roll, yaw, image}."""
@@ -104,6 +108,9 @@ class DroneStream:
             if self._is_valid_telemetry(parsed):
                 telemetry = parsed
                 self._last_telemetry = parsed
+            elif self._last_telemetry is not None and (now - self._last_ocr_warn_ts) > 2.0:
+                LOGGER.warning("Drone OCR failed; using last valid telemetry")
+                self._last_ocr_warn_ts = now
             self._last_ocr_ts = now
 
         if telemetry is None:
@@ -246,18 +253,21 @@ class DroneStream:
             return self._extract_by_pattern_only(frame)
 
         h, w = frame.shape[:2]
-        roi = frame[int(h * 0.75) : h, 0:w]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        config = "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.-:LATONGlatongmMALT "
-        text = pytesseract.image_to_string(bw, config=config)
-        parsed = self._parse_overlay_text(text)
-        if parsed is not None:
-            return parsed
-
-        return self._extract_by_pattern_only(roi)
+        rois = [
+            frame[0 : int(h * 0.42), int(w * 0.5) : w],   # top-right OSD
+            frame[0 : int(h * 0.35), 0:w],                # top full strip
+            frame[int(h * 0.7) : h, 0:w],                 # bottom telemetry strip
+        ]
+        config = "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.-:LATLONGlatlongALTMH"
+        for roi in rois:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            text = pytesseract.image_to_string(bw, config=config)
+            parsed = self._parse_overlay_text(text)
+            if parsed is not None:
+                return parsed
+        return self._extract_by_pattern_only(frame)
 
     def _extract_by_pattern_only(self, frame: np.ndarray) -> Optional[Dict[str, float]]:
         # No reliable fallback OCR without an OCR engine; keep last valid telemetry instead.

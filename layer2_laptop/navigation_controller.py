@@ -12,12 +12,17 @@ try:
     from .model2_navigation.waypoint_sender import WaypointSender
     from .model3_sensor.threshold_checker import ThresholdChecker
     from .model3_sensor.backend_poster import BackendPoster
+    from .utils.debug import debug_log
 except ImportError:
     from model2_navigation.heading_calculator import HeadingCalculator
     from model2_navigation.visual_lock import VisualLock
     from model2_navigation.waypoint_sender import WaypointSender
     from model3_sensor.threshold_checker import ThresholdChecker
     from model3_sensor.backend_poster import BackendPoster
+    try:
+        from layer2_laptop.utils.debug import debug_log
+    except ImportError:
+        from utils.debug import debug_log
 
 
 class MissionState(str, Enum):
@@ -35,12 +40,13 @@ class NavigationController:
         self,
         planner,
         rover_api,
-        backend_url: str = "http://localhost:3000/api/hazards",
+        backend_url: str = "",
         gps_tolerance_m: float = 3.0,
         vision_switch_m: float = 6.0,
         vision_conf_threshold: float = 0.55,
         camera_interval_s: float = 0.6,
         enable_vision: bool = True,
+        map_visualizer=None,
         state_cb: Optional[Callable[[MissionState], None]] = None,
     ) -> None:
         self.planner = planner
@@ -50,6 +56,7 @@ class NavigationController:
         self.sensor = ThresholdChecker()
         self.backend = BackendPoster(url=backend_url)
         self.sender = WaypointSender(rover_ip=rover_api.ip)
+        self.map_visualizer = map_visualizer
 
         self.gps_tolerance_m = gps_tolerance_m
         self.vision_switch_m = vision_switch_m
@@ -84,7 +91,14 @@ class NavigationController:
 
         self.set_state(MissionState.PLANNING)
         self.rover_api.set_target(target_node["lat"], target_node["lon"])
+        debug_log("PATH", f"Total waypoints: {len(self.planner.waypoints)}")
+        for i, waypoint in enumerate(self.planner.waypoints):
+            lat = float(waypoint.get("lat") or 0.0)
+            lon = float(waypoint.get("lon") or 0.0)
+            debug_log("WAYPOINT", f"{i} -> Lat={lat:.6f}, Lon={lon:.6f}")
         self.sender.push_plan(self.planner.waypoints)
+        if self.map_visualizer is not None:
+            self.map_visualizer.set_path(self.planner.waypoints)
 
         result = self._run_loop()
         self.running = False
@@ -116,8 +130,19 @@ class NavigationController:
                 sensor_payload = self.rover_api.get_sensor()
 
                 lat, lon, heading = self._smooth_state(state["lat"], state["lon"], state["heading"])
+                if self.map_visualizer is not None:
+                    self.map_visualizer.update_rover(lat, lon)
                 dist_to_waypoint = self.heading.haversine_distance(lat, lon, waypoint["lat"], waypoint["lon"])
                 dist_to_target = self.heading.haversine_distance(lat, lon, self.target_node["lat"], self.target_node["lon"])
+                bearing = self.heading.calculate_bearing(lat, lon, waypoint["lat"], waypoint["lon"])
+                error = self.heading.heading_error(heading, bearing)
+                debug_log(
+                    "NAV",
+                    (
+                        f"Current=({lat:.6f},{lon:.6f}) Target=({waypoint['lat']:.6f},{waypoint['lon']:.6f}) "
+                        f"Dist={dist_to_waypoint:.2f}m Bearing={bearing:.2f} Error={error:.2f}"
+                    ),
+                )
 
                 sensor_with_status = self.sensor.enrich_payload(
                     {
@@ -128,7 +153,14 @@ class NavigationController:
                     }
                 )
                 if sensor_with_status["status"] in ("YELLOW", "RED"):
+                    hazard_type = self._hazard_type(sensor_with_status["metal"], sensor_with_status["gas"])
+                    debug_log(
+                        "HAZARD",
+                        f"{hazard_type} detected at ({lat:.6f},{lon:.6f}) -> {sensor_with_status['status']}",
+                    )
                     self.backend.post(sensor_with_status)
+                    if self.map_visualizer is not None:
+                        self.map_visualizer.add_hazard(lat, lon, sensor_with_status["status"])
 
                 if sensor_payload.get("obstacle", False):
                     self.set_state(MissionState.AVOIDING_OBSTACLE)
@@ -142,6 +174,8 @@ class NavigationController:
                     replanned = self.planner.replan(curr_node["row"], curr_node["col"], self.target_node["row"], self.target_node["col"])
                     if not replanned:
                         raise RuntimeError("Replanning failed: no feasible path")
+                    if self.map_visualizer is not None:
+                        self.map_visualizer.set_path(self.planner.waypoints)
                     waypoint_index = 0
                     continue
 
@@ -164,14 +198,13 @@ class NavigationController:
                     time.sleep(0.15)
                     continue
 
-                bearing = self.heading.calculate_bearing(lat, lon, waypoint["lat"], waypoint["lon"])
-                error = self.heading.heading_error(heading, bearing)
                 cmd = self.heading.get_motion_command(error, dist_to_waypoint, turn_threshold=8, stop_distance=self.gps_tolerance_m)
                 self.rover_api.send_command(cmd)
                 time.sleep(0.35)
 
         except Exception as exc:
             self.last_error = str(exc)
+            debug_log("ERROR", str(exc))
             self.rover_api.send_command("STOP")
             self.set_state(MissionState.ERROR)
             return MissionState.ERROR
@@ -207,6 +240,17 @@ class NavigationController:
             return True
         self.rover_api.send_command("LEFT" if offset < 0 else "RIGHT")
         return False
+
+    def _hazard_type(self, metal: float, gas: float) -> str:
+        metal_alert = float(metal) >= float(self.sensor.metal_low)
+        gas_alert = float(gas) >= float(self.sensor.gas_low)
+        if metal_alert and gas_alert:
+            return "COMBINED"
+        if gas_alert:
+            return "GAS"
+        if metal_alert:
+            return "METAL"
+        return "UNKNOWN"
 
     def _smooth_state(self, lat: float, lon: float, heading: float) -> tuple[float, float, float]:
         alpha = 0.35

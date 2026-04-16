@@ -6,11 +6,19 @@ from typing import List
 
 import cv2
 import numpy as np
+try:
+    from ..utils.debug import debug_log
+except ImportError:
+    try:
+        from layer2_laptop.utils.debug import debug_log
+    except ImportError:
+        from utils.debug import debug_log
 
 
 class BoundaryExtractor:
     def __init__(self, grid_size: int = 20) -> None:
         self.grid_size = grid_size
+        self._last_boundary_signature: tuple | None = None
 
     def extract(self, grid: List[List[dict]]) -> List[dict]:
         boundary_nodes: List[dict] = []
@@ -21,6 +29,25 @@ class BoundaryExtractor:
                     continue
                 if self._touches_blocked(grid, r, c):
                     boundary_nodes.append(node)
+        if not boundary_nodes:
+            # Fallback when blocked map is sparse/empty: patrol all traversable nodes.
+            for r in range(self.grid_size):
+                for c in range(self.grid_size):
+                    node = grid[r][c]
+                    if node["status"] in ("SAFE", "PARTIAL"):
+                        boundary_nodes.append(node)
+        signature = tuple((n["row"], n["col"], n["status"]) for n in boundary_nodes)
+        if signature != self._last_boundary_signature:
+            self._last_boundary_signature = signature
+            debug_log("MODEL1", "Printing boundary nodes")
+            for node in boundary_nodes:
+                lat = float(node.get("lat") or 0.0)
+                lon = float(node.get("lon") or 0.0)
+                heuristic = float(node.get("heuristic") or 0.0)
+                status = str(node.get("status") or "UNKNOWN")
+                debug_log("NODE", f"Lat={lat:.6f}, Lon={lon:.6f}, Heuristic={heuristic:.3f}, Status={status}")
+        else:
+            debug_log("MODEL1", f"Boundary nodes unchanged (count={len(boundary_nodes)})")
         return boundary_nodes
 
     def order_nodes(self, nodes: List[dict]) -> List[dict]:
