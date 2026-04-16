@@ -11,6 +11,11 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import cv2
 import numpy as np
+try:
+    from layer2_laptop.utils.debug import debug_log
+except Exception:
+    def debug_log(_section: str, _message: str) -> None:
+        return None
 
 try:
     import pytesseract
@@ -55,6 +60,8 @@ class DroneStream:
         fallback_altitude: float = 20.0,
         allow_source_fallback: bool = False,
         blocked_sources: Optional[List[int]] = None,
+        strict_real_data: bool = True,
+        emergency_fallback: bool = False,
     ) -> None:
         self.url = url  # retained for backward compatibility; no longer used as primary source
         self.timeout_s = timeout_s
@@ -73,6 +80,10 @@ class DroneStream:
         self.allow_source_fallback = bool(allow_source_fallback)
         self.blocked_sources = set(int(s) for s in (blocked_sources or []))
         self._last_ocr_warn_ts = 0.0
+        self.strict_real_data = bool(strict_real_data)
+        self.emergency_fallback = bool(emergency_fallback)
+        if self.strict_real_data and self.simulation:
+            raise RuntimeError("STRICT_REAL_DATA enabled: DRONE_SIMULATION must be false")
 
     def capture_snapshot(self) -> Dict[str, Any]:
         """Returns {lat, lon, altitude, pitch, roll, yaw, image}."""
@@ -80,9 +91,7 @@ class DroneStream:
             webcam = self._capture_from_webcam()
             if webcam is not None:
                 return webcam
-            raise RuntimeError(
-                "Drone webcam feed unavailable. Close other camera apps and verify DRONE_VIDEO_SOURCE."
-            )
+            raise RuntimeError("Drone webcam feed unavailable. Close other camera apps and verify DRONE_VIDEO_SOURCE.")
         return self._simulate_snapshot()
 
     def close(self) -> None:
@@ -114,11 +123,15 @@ class DroneStream:
             self._last_ocr_ts = now
 
         if telemetry is None:
-            telemetry = {
-                "lat": self.fallback_lat,
-                "lon": self.fallback_lon,
-                "altitude": self.fallback_altitude,
-            }
+            if self.emergency_fallback:
+                debug_log("ERROR", "Drone OCR telemetry missing; using emergency fallback coordinates")
+                telemetry = {
+                    "lat": self.fallback_lat,
+                    "lon": self.fallback_lon,
+                    "altitude": self.fallback_altitude,
+                }
+            else:
+                raise RuntimeError("Drone telemetry missing from OCR")
 
         return {
             "lat": telemetry["lat"],

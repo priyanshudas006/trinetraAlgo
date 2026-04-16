@@ -158,15 +158,21 @@ class RoverAPI:
         simulation: bool = False,
         camera_url: Optional[str] = None,
         camera_timeout_s: float = 0.35,
+        strict_real_data: bool = True,
+        emergency_fallback: bool = False,
     ) -> None:
         self.ip = ip.rstrip("/")
         self.timeout_s = timeout_s
         self.camera_url = (camera_url or f"{self.ip}/camera").rstrip("/")
         self.camera_timeout_s = camera_timeout_s
         self.simulation = simulation
+        self.strict_real_data = bool(strict_real_data)
+        self.emergency_fallback = bool(emergency_fallback)
         self.sim = _RoverSimulator() if simulation else None
-        self._last_state = {"lat": 0.0, "lon": 0.0, "heading": 0.0}
-        self._last_sensor = {"metal": 0.0, "gas": 0.0, "obstacle": False}
+        if self.strict_real_data and self.simulation:
+            raise RuntimeError("STRICT_REAL_DATA enabled: ROVER_SIMULATION must be false")
+        self._last_state: Optional[dict] = None
+        self._last_sensor: Optional[dict] = None
         self._camera_cap: Optional[cv2.VideoCapture] = None
         self._last_camera_frame: Optional[np.ndarray] = None
         self._state_failures = 0
@@ -178,15 +184,18 @@ class RoverAPI:
         if self.simulation and self.sim is not None:
             return self.sim.get_state()
         payload = self._request_json("GET", "/state")
-        if payload is not None:
-            self._last_state = {
-                "lat": self._coerce_float(payload, ("lat", "latitude"), self._last_state["lat"]),
-                "lon": self._coerce_float(payload, ("lon", "lng", "longitude"), self._last_state["lon"]),
-                "heading": self._coerce_float(payload, ("heading", "yaw", "hdg"), self._last_state["heading"]),
-            }
-            self._state_failures = 0
-        else:
+        if payload is None:
             self._state_failures += 1
+            if self.emergency_fallback and self._last_state is not None:
+                return dict(self._last_state)
+            raise RuntimeError("Rover state missing from ESP32 endpoint /state")
+
+        self._last_state = {
+            "lat": self._required_float(payload, ("lat", "latitude"), "/state"),
+            "lon": self._required_float(payload, ("lon", "lng", "longitude"), "/state"),
+            "heading": self._required_float(payload, ("heading", "yaw", "hdg"), "/state"),
+        }
+        self._state_failures = 0
         return dict(self._last_state)
 
     def send_command(self, cmd: str) -> bool:
@@ -222,19 +231,22 @@ class RoverAPI:
     def get_sensor(self) -> dict:
         if self.simulation and self.sim is not None:
             sensor = self.sim.get_sensor()
-            debug_log("SENSOR", f"Gas={sensor.get('gas', 0.0)}, Metal={sensor.get('metal', 0.0)}")
+            debug_log("SENSOR", f"Gas={sensor['gas']}, Metal={sensor['metal']}")
             return sensor
         payload = self._request_json("GET", "/sensor")
-        if payload is not None:
-            self._last_sensor = {
-                "metal": self._coerce_float(payload, ("metal", "metal_value", "metalValue"), self._last_sensor["metal"]),
-                "gas": self._coerce_float(payload, ("gas", "mq2", "gas_value", "gasValue"), self._last_sensor["gas"]),
-                "obstacle": self._coerce_bool(payload, ("obstacle", "obstacle_detected", "hasObstacle"), self._last_sensor["obstacle"]),
-            }
-            self._sensor_failures = 0
-            debug_log("SENSOR", f"Gas={self._last_sensor['gas']}, Metal={self._last_sensor['metal']}")
-        else:
+        if payload is None:
             self._sensor_failures += 1
+            if self.emergency_fallback and self._last_sensor is not None:
+                return dict(self._last_sensor)
+            raise RuntimeError("Sensor data missing from ESP32 endpoint /sensor")
+
+        self._last_sensor = {
+            "metal": self._required_float(payload, ("metal", "metal_value", "metalValue"), "/sensor"),
+            "gas": self._required_float(payload, ("gas", "mq2", "gas_value", "gasValue"), "/sensor"),
+            "obstacle": self._required_bool(payload, ("obstacle", "obstacle_detected", "hasObstacle"), "/sensor"),
+        }
+        self._sensor_failures = 0
+        debug_log("SENSOR", f"Gas={self._last_sensor['gas']}, Metal={self._last_sensor['metal']}")
         return dict(self._last_sensor)
 
     def get_camera_frame(self) -> np.ndarray:
@@ -251,15 +263,19 @@ class RoverAPI:
                     self.camera_url = url
                 return image
 
-        if self._last_camera_frame is None:
-            raise RuntimeError("Camera frame unavailable")
-        return self._last_camera_frame
+        if self.emergency_fallback and self._last_camera_frame is not None:
+            return self._last_camera_frame
+        raise RuntimeError("Camera frame unavailable from live rover source")
 
     def set_target(self, lat: float, lon: float) -> None:
         if self.simulation and self.sim is not None:
             self.sim.set_target(lat, lon)
             return
-        requests.post(f"{self.ip}/mission/target", json={"lat": lat, "lon": lon}, timeout=self.timeout_s)
+        try:
+            response = requests.post(f"{self.ip}/mission/target", json={"lat": lat, "lon": lon}, timeout=self.timeout_s)
+            response.raise_for_status()
+        except Exception as error:
+            raise RuntimeError(f"Failed to send mission target to ESP32: {error}") from error
 
     def set_target_signature(self, images: List[np.ndarray]) -> None:
         if self.simulation and self.sim is not None:
@@ -378,6 +394,30 @@ class RoverAPI:
                 uniq.append(u)
         return uniq
 
+    @staticmethod
+    def _required_float(payload: dict, keys: tuple[str, ...], endpoint: str) -> float:
+        for key in keys:
+            if key in payload:
+                try:
+                    return float(payload[key])
+                except Exception:
+                    break
+        raise RuntimeError(f"Invalid/missing numeric field {keys} from ESP32 {endpoint} payload")
+
+    @staticmethod
+    def _required_bool(payload: dict, keys: tuple[str, ...], endpoint: str) -> bool:
+        for key in keys:
+            if key in payload:
+                value = payload[key]
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return value != 0
+                if isinstance(value, str):
+                    return value.strip().lower() in ("1", "true", "yes", "on")
+                break
+        raise RuntimeError(f"Invalid/missing boolean field {keys} from ESP32 {endpoint} payload")
+
     def _request_json(self, method: str, path: str) -> Optional[dict]:
         url = f"{self.ip}{path}"
         for _ in range(self._request_retries + 1):
@@ -388,6 +428,7 @@ class RoverAPI:
                     response = requests.request(method, url, timeout=self.timeout_s)
                 response.raise_for_status()
                 return response.json()
-            except Exception:
+            except Exception as error:
+                debug_log("ERROR", f"ESP32 {method} {path} failed: {error}")
                 time.sleep(0.05)
         return None

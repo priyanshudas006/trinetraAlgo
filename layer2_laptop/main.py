@@ -39,10 +39,12 @@ try:
         DRONE_SIMULATION,
         DRONE_SOURCE_FALLBACK,
         DRONE_VIDEO_SOURCE,
+        EMERGENCY_FALLBACK,
         ROVER_BASE_URL,
         ROVER_CAMERA_URL,
         ROVER_SIMULATION,
         ROVER_TIMEOUT_SECONDS,
+        STRICT_REAL_DATA,
     )
 except ImportError:
     from model1_surveillance.boundary_extractor import BoundaryExtractor
@@ -66,10 +68,12 @@ except ImportError:
         DRONE_SIMULATION,
         DRONE_SOURCE_FALLBACK,
         DRONE_VIDEO_SOURCE,
+        EMERGENCY_FALLBACK,
         ROVER_BASE_URL,
         ROVER_CAMERA_URL,
         ROVER_SIMULATION,
         ROVER_TIMEOUT_SECONDS,
+        STRICT_REAL_DATA,
     )
 
 
@@ -96,12 +100,16 @@ class TrinetraSystem:
             fallback_altitude=DRONE_DEFAULT_ALT,
             allow_source_fallback=DRONE_SOURCE_FALLBACK,
             blocked_sources=blocked_sources,
+            strict_real_data=STRICT_REAL_DATA,
+            emergency_fallback=EMERGENCY_FALLBACK,
         )
         self.rover_api = RoverAPI(
             ip=ROVER_BASE_URL,
             camera_url=ROVER_CAMERA_URL,
             timeout_s=ROVER_TIMEOUT_SECONDS,
             simulation=ROVER_SIMULATION,
+            strict_real_data=STRICT_REAL_DATA,
+            emergency_fallback=EMERGENCY_FALLBACK,
         )
 
         self.terrain_detector = TerrainDetector()
@@ -318,10 +326,7 @@ class TrinetraSystem:
             boundary = self.boundary_extractor.extract(self.grid)
             ordered = self.boundary_extractor.order_nodes(boundary)
             if not ordered:
-                traversable = [n for row in self.grid for n in row if n["status"] in ("SAFE", "PARTIAL")]
-                if not traversable:
-                    return False, "No surveillance boundary path available"
-                ordered = traversable
+                return False, "No surveillance boundary path available from real Model1 output"
             self._planner.build_path(ordered)
             mission_target = ordered[-1]
             enable_vision = False

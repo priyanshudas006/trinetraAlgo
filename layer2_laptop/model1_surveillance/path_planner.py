@@ -6,6 +6,13 @@ import heapq
 import json
 import math
 from typing import Dict, List, Optional, Tuple
+try:
+    from ..utils.debug import debug_log
+except ImportError:
+    try:
+        from layer2_laptop.utils.debug import debug_log
+    except ImportError:
+        from utils.debug import debug_log
 
 Grid = List[List[dict]]
 
@@ -26,6 +33,7 @@ class PathPlanner:
 
     def build_path(self, boundary_nodes_with_latlon: List[dict]) -> List[dict]:
         self.waypoints = [self._as_waypoint(i, node) for i, node in enumerate(boundary_nodes_with_latlon)]
+        self._log_selected_path()
         return self.waypoints
 
     def astar(self, start_row: int, start_col: int, target_row: int, target_col: int) -> List[dict]:
@@ -150,7 +158,20 @@ class PathPlanner:
         waypoints = [self._as_waypoint(i, self.grid[r][c]) for i, (r, c) in enumerate(chain)]
         self.waypoints = waypoints
         self._cache[cache_key] = [wp.copy() for wp in waypoints]
+        self._log_selected_path()
         return waypoints
+
+    def _log_selected_path(self) -> None:
+        debug_log("PATH", f"Selected path nodes: {len(self.waypoints)}")
+        for i, wp in enumerate(self.waypoints):
+            debug_log(
+                "PATH_NODE",
+                (
+                    f"{i} -> row={wp['row']} col={wp['col']} "
+                    f"lat={float(wp['lat']):.6f} lon={float(wp['lon']):.6f} "
+                    f"heuristic={float(wp['heuristic']):.3f} status={wp['status']}"
+                ),
+            )
 
     def _as_waypoint(self, idx: int, node: dict) -> dict:
         return {

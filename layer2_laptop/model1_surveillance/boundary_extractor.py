@@ -39,8 +39,8 @@ class BoundaryExtractor:
         signature = tuple((n["row"], n["col"], n["status"]) for n in boundary_nodes)
         if signature != self._last_boundary_signature:
             self._last_boundary_signature = signature
-            debug_log("MODEL1", "Printing boundary nodes")
-            for node in boundary_nodes:
+            debug_log("MODEL1", f"Boundary node count={len(boundary_nodes)}")
+            for node in boundary_nodes[:10]:
                 lat = float(node.get("lat") or 0.0)
                 lon = float(node.get("lon") or 0.0)
                 heuristic = float(node.get("heuristic") or 0.0)

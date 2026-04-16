@@ -89,16 +89,25 @@ class NavigationController:
         self.running = True
         self._vision_fail_count = 0
 
-        self.set_state(MissionState.PLANNING)
-        self.rover_api.set_target(target_node["lat"], target_node["lon"])
-        debug_log("PATH", f"Total waypoints: {len(self.planner.waypoints)}")
-        for i, waypoint in enumerate(self.planner.waypoints):
-            lat = float(waypoint.get("lat") or 0.0)
-            lon = float(waypoint.get("lon") or 0.0)
-            debug_log("WAYPOINT", f"{i} -> Lat={lat:.6f}, Lon={lon:.6f}")
-        self.sender.push_plan(self.planner.waypoints)
-        if self.map_visualizer is not None:
-            self.map_visualizer.set_path(self.planner.waypoints)
+        try:
+            self.set_state(MissionState.PLANNING)
+            self.rover_api.set_target(target_node["lat"], target_node["lon"])
+            debug_log("PATH", f"Total waypoints: {len(self.planner.waypoints)}")
+            for i, waypoint in enumerate(self.planner.waypoints):
+                lat = float(waypoint.get("lat") or 0.0)
+                lon = float(waypoint.get("lon") or 0.0)
+                debug_log("WAYPOINT", f"{i} -> Lat={lat:.6f}, Lon={lon:.6f}")
+            if not self.sender.push_plan(self.planner.waypoints):
+                raise RuntimeError("Failed to upload waypoint plan to ESP32 endpoint /mission/path")
+            if self.map_visualizer is not None:
+                self.map_visualizer.set_path(self.planner.waypoints)
+        except Exception as exc:
+            self.last_error = str(exc)
+            debug_log("ERROR", str(exc))
+            self.rover_api.send_command("STOP")
+            self.set_state(MissionState.ERROR)
+            self.running = False
+            return MissionState.ERROR
 
         result = self._run_loop()
         self.running = False
@@ -128,6 +137,8 @@ class NavigationController:
                 self.set_state(MissionState.NAVIGATING)
                 state = self.rover_api.get_state()
                 sensor_payload = self.rover_api.get_sensor()
+                self._validate_state_payload(state)
+                self._validate_sensor_payload(sensor_payload)
 
                 lat, lon, heading = self._smooth_state(state["lat"], state["lon"], state["heading"])
                 if self.map_visualizer is not None:
@@ -148,8 +159,8 @@ class NavigationController:
                     {
                         "lat": lat,
                         "lon": lon,
-                        "metal": sensor_payload.get("metal", 0.0),
-                        "gas": sensor_payload.get("gas", 0.0),
+                        "metal": sensor_payload["metal"],
+                        "gas": sensor_payload["gas"],
                     }
                 )
                 if sensor_with_status["status"] in ("YELLOW", "RED"):
@@ -162,10 +173,12 @@ class NavigationController:
                     if self.map_visualizer is not None:
                         self.map_visualizer.add_hazard(lat, lon, sensor_with_status["status"])
 
-                if sensor_payload.get("obstacle", False):
+                if sensor_payload["obstacle"]:
                     self.set_state(MissionState.AVOIDING_OBSTACLE)
-                    self.rover_api.send_command("STOP")
-                    self.rover_api.send_command("RIGHT")
+                    if not self.rover_api.send_command("STOP"):
+                        raise RuntimeError("Failed to send STOP command to ESP32")
+                    if not self.rover_api.send_command("RIGHT"):
+                        raise RuntimeError("Failed to send RIGHT command to ESP32")
                     time.sleep(0.3)
                     curr_node = self.planner.nearest_node(lat, lon, traversable_only=True)
                     if curr_node is None:
@@ -199,7 +212,8 @@ class NavigationController:
                     continue
 
                 cmd = self.heading.get_motion_command(error, dist_to_waypoint, turn_threshold=8, stop_distance=self.gps_tolerance_m)
-                self.rover_api.send_command(cmd)
+                if not self.rover_api.send_command(cmd):
+                    raise RuntimeError(f"ESP32 command send failed: {cmd}")
                 time.sleep(0.35)
 
         except Exception as exc:
@@ -230,15 +244,19 @@ class NavigationController:
 
         if not detected or confidence < self.vision_conf_threshold:
             self._vision_fail_count += 1
-            self.rover_api.send_command("FORWARD")
+            if not self.rover_api.send_command("FORWARD"):
+                raise RuntimeError("ESP32 command send failed during vision lock: FORWARD")
             return False
 
         self._vision_fail_count = 0
         offset = details.get("offset_px", 0.0)
         if abs(offset) <= 22:
-            self.rover_api.send_command("STOP")
+            if not self.rover_api.send_command("STOP"):
+                raise RuntimeError("ESP32 command send failed during vision lock: STOP")
             return True
-        self.rover_api.send_command("LEFT" if offset < 0 else "RIGHT")
+        turn_cmd = "LEFT" if offset < 0 else "RIGHT"
+        if not self.rover_api.send_command(turn_cmd):
+            raise RuntimeError(f"ESP32 command send failed during vision lock: {turn_cmd}")
         return False
 
     def _hazard_type(self, metal: float, gas: float) -> str:
@@ -266,3 +284,15 @@ class NavigationController:
         delta = self.heading.heading_error(current, float(heading))
         self._smooth_heading = (current + (alpha * delta)) % 360.0
         return self._smooth_lat, self._smooth_lon, self._smooth_heading
+
+    @staticmethod
+    def _validate_state_payload(state: dict) -> None:
+        for key in ("lat", "lon", "heading"):
+            if key not in state or state[key] is None:
+                raise RuntimeError(f"Rover state missing required field: {key}")
+
+    @staticmethod
+    def _validate_sensor_payload(sensor_payload: dict) -> None:
+        for key in ("metal", "gas", "obstacle"):
+            if key not in sensor_payload or sensor_payload[key] is None:
+                raise RuntimeError(f"Sensor payload missing required field: {key}")
