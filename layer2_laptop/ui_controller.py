@@ -26,6 +26,7 @@ class UIController:
         self._latest_camera_frame = None
         self._camera_lock = threading.Lock()
         self._camera_error_count = 0
+        self._live_source = "rover"
 
         self._build_layout()
         self.main.set_ui_state_callback(self.update_state)
@@ -54,6 +55,8 @@ class UIController:
         add_btn("Refresh Camera", self.refresh_camera)
         add_btn("Start Live Camera", self.start_live_camera)
         add_btn("Stop Live Camera", self.stop_live_camera)
+        add_btn("Start Live Drone Feed", self.start_live_drone)
+        add_btn("Stop Live Drone Feed", self.stop_live_drone)
 
         tk.Label(sidebar, textvariable=self.state_var, bg="#1d1f22", fg="#9bd67d", wraplength=250, justify="left").pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(sidebar, textvariable=self.info_var, bg="#1d1f22", fg="#e5e5e5", wraplength=250, justify="left").pack(fill="x", padx=14)
@@ -136,23 +139,49 @@ class UIController:
         self.info_var.set("Camera frame refreshed")
 
     def start_live_camera(self) -> None:
+        self._start_live_feed("rover")
+
+    def stop_live_camera(self) -> None:
+        if self._live_source == "rover":
+            self._stop_live_feed("rover")
+        else:
+            self.info_var.set("Rover live feed is not active")
+
+    def start_live_drone(self) -> None:
+        self._start_live_feed("drone")
+
+    def stop_live_drone(self) -> None:
+        if self._live_source == "drone":
+            self._stop_live_feed("drone")
+        else:
+            self.info_var.set("Drone live feed is not active")
+
+    def _start_live_feed(self, source: str) -> None:
+        source_name = "drone" if source == "drone" else "rover"
         if self._live_camera:
-            self.info_var.set("Live camera already running")
-            return
+            if self._live_source == source:
+                self.info_var.set(f"Live {source_name} feed already running")
+                return
+            self._live_camera = False
+            time.sleep(0.1)
         self._live_camera = True
+        self._live_source = source
         self._camera_error_count = 0
         self._camera_thread = threading.Thread(target=self._camera_worker, daemon=True)
         self._camera_thread.start()
         self._schedule_live_render()
-        self.info_var.set("Live camera started")
+        self.info_var.set(f"Live {source_name} feed started")
 
-    def stop_live_camera(self) -> None:
+    def _stop_live_feed(self, source_name: str) -> None:
         self._live_camera = False
-        self.info_var.set("Live camera stopped")
+        self.info_var.set(f"Live {source_name} feed stopped")
 
     def _camera_worker(self) -> None:
         while self._live_camera:
-            frame = self.main.get_camera_frame()
+            if self._live_source == "drone":
+                frame = self.main.get_drone_frame()
+            else:
+                frame = self.main.get_camera_frame()
             if frame is None:
                 self._camera_error_count += 1
                 time.sleep(0.15)
@@ -171,7 +200,7 @@ class UIController:
         if frame is not None:
             self.show_image(frame)
         elif self._camera_error_count > 20:
-            self.info_var.set("Live camera unstable/unavailable")
+            self.info_var.set(f"Live {self._live_source} feed unstable/unavailable")
         self.root.after(90, self._schedule_live_render)
 
     def show_image(self, frame) -> None:
