@@ -43,6 +43,10 @@ class UIController:
         tk.Radiobutton(sidebar, text="Surveillance Mode", variable=self.mode_var, value="surveillance", command=self._on_mode_change, bg="#1d1f22", fg="white", selectcolor="#1d1f22").pack(anchor="w", padx=14, pady=(0, 12))
 
         add_btn("Load Drone Snapshot", self.load_snapshot)
+        add_btn("Preview Drone Camera", self.preview_drone_camera)
+        add_btn("Auto Detect Drone Source", self.auto_detect_drone_source)
+        add_btn("Drone Source -", self.drone_source_prev)
+        add_btn("Drone Source +", self.drone_source_next)
         add_btn("Select Target Node", self.select_target)
         add_btn("Upload Target Images", self.upload_images)
         add_btn("Start Mission", self.start_mission)
@@ -72,6 +76,32 @@ class UIController:
         self.info_var.set(message)
         if ok:
             self.show_image(self.main.get_display_map())
+
+    def preview_drone_camera(self) -> None:
+        frame = self.main.get_drone_frame()
+        if frame is None:
+            self.info_var.set("Drone camera unavailable. Check DRONE_VIDEO_SOURCE and close Camera app.")
+            return
+        self.show_image(frame)
+        self.info_var.set("Drone camera preview updated")
+
+    def auto_detect_drone_source(self) -> None:
+        ok, message = self.main.auto_select_drone_source()
+        self.info_var.set(message)
+        if ok:
+            self.preview_drone_camera()
+
+    def drone_source_prev(self) -> None:
+        ok, message = self.main.cycle_drone_source(step=-1)
+        self.info_var.set(message)
+        if ok:
+            self.preview_drone_camera()
+
+    def drone_source_next(self) -> None:
+        ok, message = self.main.cycle_drone_source(step=1)
+        self.info_var.set(message)
+        if ok:
+            self.preview_drone_camera()
 
     def select_target(self) -> None:
         ok, message = self.main.select_target_from_map()

@@ -6,7 +6,7 @@ import re
 import time
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -47,6 +47,11 @@ class DroneStream:
         video_source: int | str = 0,
         ocr_interval_s: float = 0.6,
         ocr_every_n_frames: int = 10,
+        fallback_lat: float = 29.9000,
+        fallback_lon: float = 78.1000,
+        fallback_altitude: float = 20.0,
+        allow_source_fallback: bool = False,
+        blocked_sources: Optional[List[int]] = None,
     ) -> None:
         self.url = url  # retained for backward compatibility; no longer used as primary source
         self.timeout_s = timeout_s
@@ -58,6 +63,12 @@ class DroneStream:
         self._last_telemetry: Optional[Dict[str, float]] = None
         self._frame_index = 0
         self.ocr_every_n_frames = max(1, int(ocr_every_n_frames))
+        self._active_source: Optional[int | str] = None
+        self.fallback_lat = float(fallback_lat)
+        self.fallback_lon = float(fallback_lon)
+        self.fallback_altitude = float(fallback_altitude)
+        self.allow_source_fallback = bool(allow_source_fallback)
+        self.blocked_sources = set(int(s) for s in (blocked_sources or []))
 
     def capture_snapshot(self) -> Dict[str, Any]:
         """Returns {lat, lon, altitude, pitch, roll, yaw, image}."""
@@ -65,6 +76,9 @@ class DroneStream:
             webcam = self._capture_from_webcam()
             if webcam is not None:
                 return webcam
+            raise RuntimeError(
+                "Drone webcam feed unavailable. Close other camera apps and verify DRONE_VIDEO_SOURCE."
+            )
         return self._simulate_snapshot()
 
     def close(self) -> None:
@@ -93,7 +107,11 @@ class DroneStream:
             self._last_ocr_ts = now
 
         if telemetry is None:
-            return None
+            telemetry = {
+                "lat": self.fallback_lat,
+                "lon": self.fallback_lon,
+                "altitude": self.fallback_altitude,
+            }
 
         return {
             "lat": telemetry["lat"],
@@ -107,17 +125,121 @@ class DroneStream:
 
     def _read_frame(self) -> Optional[np.ndarray]:
         if self._cap is None:
-            self._cap = cv2.VideoCapture(self.video_source)
-            if not self._cap.isOpened():
-                self._cap.release()
-                self._cap = None
+            self._cap, self._active_source = self._open_capture_with_fallback(self.video_source)
+            if self._cap is None:
                 return None
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         ok, frame = self._cap.read()
         if not ok or frame is None:
-            return None
+            # Device might have glitched or switched ownership; reopen once.
+            self.close()
+            self._cap, self._active_source = self._open_capture_with_fallback(self.video_source)
+            if self._cap is None:
+                return None
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                return None
         return frame
+
+    def _open_capture_with_fallback(self, source: int | str) -> tuple[Optional[cv2.VideoCapture], Optional[int | str]]:
+        candidates: list[int | str] = [source]
+        if self.allow_source_fallback and isinstance(source, int):
+            candidates.extend([max(0, source + 1), max(0, source + 2)])
+
+        for candidate in candidates:
+            if isinstance(candidate, int) and candidate in self.blocked_sources:
+                continue
+            cap = self._open_capture(candidate)
+            if cap is not None:
+                return cap, candidate
+        return None, None
+
+    def get_active_source(self) -> Optional[int | str]:
+        return self._active_source
+
+    def set_video_source(self, source: int | str) -> None:
+        self.video_source = self._normalize_source(source)
+        self.close()
+
+    def get_configured_source(self) -> int | str:
+        return self.video_source
+
+    def auto_select_source(self, max_sources: int = 6, osd_keywords: Optional[List[str]] = None) -> tuple[bool, str]:
+        keywords = [k.strip().upper() for k in (osd_keywords or ["BATT", "HOR", "GPS", "ALT"]) if k.strip()]
+        best_source: Optional[int] = None
+        best_score: float = -1.0
+
+        for idx in range(max(1, int(max_sources))):
+            if idx in self.blocked_sources:
+                continue
+            cap = self._open_capture(idx)
+            if cap is None:
+                continue
+            frames = []
+            for _ in range(4):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frames.append(frame)
+            cap.release()
+            if not frames:
+                continue
+
+            score = self._score_source(frames, keywords)
+            if score > best_score:
+                best_score = score
+                best_source = idx
+
+        if best_source is None:
+            return False, "No camera source could be opened"
+
+        self.set_video_source(best_source)
+        return True, f"Auto-selected drone source index: {best_source} (score={best_score:.2f})"
+
+    def _score_source(self, frames: List[np.ndarray], keywords: List[str]) -> float:
+        score = 0.0
+        if len(frames) >= 2:
+            g0 = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+            g1 = cv2.cvtColor(frames[-1], cv2.COLOR_BGR2GRAY)
+            motion = float(np.mean(cv2.absdiff(g0, g1)))
+            score += min(25.0, motion / 2.0)
+
+        if pytesseract is not None and keywords:
+            h, w = frames[-1].shape[:2]
+            roi = frames[-1][int(h * 0.55) : h, 0:w]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            text = pytesseract.image_to_string(
+                bw, config="--oem 1 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:<-> "
+            ).upper()
+            hits = sum(1 for k in keywords if k in text)
+            score += hits * 20.0
+
+        # Penalize likely OBS "camera off" splash (dominant blue + static icon)
+        hsv = cv2.cvtColor(frames[-1], cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([95, 40, 30], dtype=np.uint8), np.array([135, 255, 255], dtype=np.uint8))
+        blue_ratio = float(np.count_nonzero(blue)) / float(blue.size)
+        if blue_ratio > 0.55:
+            score -= 12.0
+
+        return score
+
+    @staticmethod
+    def _open_capture(source: int | str) -> Optional[cv2.VideoCapture]:
+        cap = None
+        if isinstance(source, int):
+            # CAP_DSHOW is more reliable on Windows webcam devices.
+            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(source)
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            return None
+        return cap
 
     def _extract_telemetry_from_frame(self, frame: np.ndarray) -> Optional[Dict[str, float]]:
         if pytesseract is None:

@@ -10,6 +10,7 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,7 +30,14 @@ try:
         BACKEND_HAZARD_URL,
         DRONE_OCR_EVERY_N_FRAMES,
         DRONE_OCR_INTERVAL_SECONDS,
+        DRONE_DEFAULT_ALT,
+        DRONE_DEFAULT_LAT,
+        DRONE_DEFAULT_LON,
+        DRONE_AUTODETECT_MAX_SOURCES,
+        DRONE_BLOCKED_SOURCES,
+        DRONE_OSD_KEYWORDS,
         DRONE_SIMULATION,
+        DRONE_SOURCE_FALLBACK,
         DRONE_VIDEO_SOURCE,
         ROVER_BASE_URL,
         ROVER_CAMERA_URL,
@@ -49,7 +57,14 @@ except ImportError:
         BACKEND_HAZARD_URL,
         DRONE_OCR_EVERY_N_FRAMES,
         DRONE_OCR_INTERVAL_SECONDS,
+        DRONE_DEFAULT_ALT,
+        DRONE_DEFAULT_LAT,
+        DRONE_DEFAULT_LON,
+        DRONE_AUTODETECT_MAX_SOURCES,
+        DRONE_BLOCKED_SOURCES,
+        DRONE_OSD_KEYWORDS,
         DRONE_SIMULATION,
+        DRONE_SOURCE_FALLBACK,
         DRONE_VIDEO_SOURCE,
         ROVER_BASE_URL,
         ROVER_CAMERA_URL,
@@ -65,11 +80,22 @@ class TrinetraSystem:
         self.image_h = 1000
 
         self.mode = "target"
+        blocked_sources = []
+        if DRONE_BLOCKED_SOURCES:
+            for token in DRONE_BLOCKED_SOURCES.split(","):
+                token = token.strip()
+                if token.isdigit():
+                    blocked_sources.append(int(token))
         self.drone = DroneStream(
             simulation=DRONE_SIMULATION,
             video_source=DRONE_VIDEO_SOURCE,
             ocr_interval_s=DRONE_OCR_INTERVAL_SECONDS,
             ocr_every_n_frames=DRONE_OCR_EVERY_N_FRAMES,
+            fallback_lat=DRONE_DEFAULT_LAT,
+            fallback_lon=DRONE_DEFAULT_LON,
+            fallback_altitude=DRONE_DEFAULT_ALT,
+            allow_source_fallback=DRONE_SOURCE_FALLBACK,
+            blocked_sources=blocked_sources,
         )
         self.rover_api = RoverAPI(
             ip=ROVER_BASE_URL,
@@ -81,12 +107,15 @@ class TrinetraSystem:
         self.terrain_detector = TerrainDetector()
         self.grid_builder = GridHeuristics(grid_size=self.grid_size, obstacle_inflation_px=12)
         self.boundary_extractor = BoundaryExtractor(grid_size=self.grid_size)
+        self.drone_autodetect_max_sources = DRONE_AUTODETECT_MAX_SOURCES
+        self.drone_osd_keywords = [k.strip() for k in DRONE_OSD_KEYWORDS.split(",") if k.strip()]
 
         self.drone_data: Optional[dict] = None
         self.grid: Optional[List[List[dict]]] = None
         self.terrain_data: Optional[dict] = None
         self.selected_target: Optional[dict] = None
         self.target_images: List = []
+        self._last_open_ratio: float = 0.0
 
         self._planner: Optional[PathPlanner] = None
         self._nav: Optional[NavigationController] = None
@@ -112,6 +141,7 @@ class TrinetraSystem:
             image = self.drone_data["image"]
             self.terrain_data = self.terrain_detector.detect(image, pitch_deg=self.drone_data["pitch"], roll_deg=self.drone_data["roll"])
             self.grid = self.grid_builder.build(self.terrain_data["open_mask"])
+            self._last_open_ratio = float(np.count_nonzero(self.terrain_data["open_mask"])) / float(self.terrain_data["open_mask"].size)
 
             mapper = NodeLatLon(
                 drone_lat=self.drone_data["lat"],
@@ -129,14 +159,66 @@ class TrinetraSystem:
                     mapper.calculate(node)
 
             self.selected_target = None
-            return True, "Drone snapshot loaded and map processed"
+            source = "SIMULATION" if DRONE_SIMULATION else "WEBCAM"
+            active = self.drone.get_active_source()
+            return True, f"Drone snapshot loaded and map processed ({source}, source={active})"
         except Exception as exc:
             return False, f"Failed to process drone snapshot: {exc}"
+
+    def get_drone_frame(self):
+        try:
+            snap = self.drone.capture_snapshot()
+            return snap.get("image")
+        except Exception:
+            return None
+
+    def auto_select_drone_source(self) -> Tuple[bool, str]:
+        try:
+            ok, msg = self.drone.auto_select_source(
+                max_sources=self.drone_autodetect_max_sources,
+                osd_keywords=self.drone_osd_keywords,
+            )
+            return ok, msg
+        except Exception as exc:
+            return False, f"Auto source detect failed: {exc}"
+
+    def cycle_drone_source(self, step: int, max_sources: int = 8) -> Tuple[bool, str]:
+        try:
+            current = self.drone.get_configured_source()
+            if not isinstance(current, int):
+                current = 0
+            total = max(1, int(max_sources))
+            for _ in range(total):
+                next_idx = (current + step) % total
+                current = next_idx
+                if next_idx in self.drone.blocked_sources:
+                    continue
+                self.drone.set_video_source(next_idx)
+                frame = self.get_drone_frame()
+                if frame is not None:
+                    return True, f"Drone source switched to index {next_idx}"
+            return False, "No usable drone source found while cycling"
+        except Exception as exc:
+            return False, f"Failed to switch drone source: {exc}"
 
     def get_display_map(self):
         if self.terrain_data is None or self.grid is None:
             return None
-        canvas = cv2.resize(self.terrain_data["terrain_map"].copy(), (self.image_w, self.image_h))
+        # If segmentation confidence is low (typical with indoor FPV debug feed),
+        # show raw drone frame with grid overlay instead of nearly-black terrain map.
+        if self._last_open_ratio < 0.03 and self.drone_data is not None:
+            canvas = cv2.resize(self.drone_data["image"].copy(), (self.image_w, self.image_h))
+            cv2.putText(
+                canvas,
+                "LOW TERRAIN CONFIDENCE - SHOWING RAW DRONE FEED",
+                (16, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 215, 255),
+                2,
+            )
+        else:
+            canvas = cv2.resize(self.terrain_data["terrain_map"].copy(), (self.image_w, self.image_h))
         cell_w = self.image_w // self.grid_size
         cell_h = self.image_h // self.grid_size
 
@@ -145,9 +227,9 @@ class TrinetraSystem:
                 x1, y1 = c * cell_w, r * cell_h
                 x2, y2 = x1 + cell_w, y1 + cell_h
                 node = self.grid[r][c]
-                if node["status"] == "BLOCKED":
+                if self._last_open_ratio >= 0.03 and node["status"] == "BLOCKED":
                     cv2.rectangle(canvas, (x1, y1), (x2, y2), (45, 45, 45), -1)
-                elif node["status"] == "PARTIAL":
+                elif self._last_open_ratio >= 0.03 and node["status"] == "PARTIAL":
                     cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 170, 220), -1)
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (70, 70, 70), 1)
 

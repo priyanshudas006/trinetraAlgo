@@ -6,6 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -213,15 +214,15 @@ class RoverAPI:
     def get_camera_frame(self) -> np.ndarray:
         if self.simulation and self.sim is not None:
             return self.sim.get_camera_frame()
-        if self._is_stream_source(self.camera_url):
-            image = self._read_stream_frame()
+        for url in self._camera_candidates():
+            if self._is_stream_source(url):
+                image = self._read_stream_frame(url)
+            else:
+                image = self._read_snapshot_frame(url)
             if image is not None:
                 self._last_camera_frame = image
-                return image
-        else:
-            image = self._read_snapshot_frame()
-            if image is not None:
-                self._last_camera_frame = image
+                if url != self.camera_url:
+                    self.camera_url = url
                 return image
 
         if self._last_camera_frame is None:
@@ -252,9 +253,15 @@ class RoverAPI:
             self._camera_cap.release()
             self._camera_cap = None
 
-    def _read_stream_frame(self) -> Optional[np.ndarray]:
+    def _read_stream_frame(self, url: str) -> Optional[np.ndarray]:
+        if self._camera_cap is not None and str(self._camera_cap.getBackendName() if hasattr(self._camera_cap, "getBackendName") else ""):
+            # keep existing capture if URL unchanged
+            pass
+        if getattr(self, "_camera_cap_url", None) != url and self._camera_cap is not None:
+            self._camera_cap.release()
+            self._camera_cap = None
         if self._camera_cap is None:
-            self._camera_cap = cv2.VideoCapture(self.camera_url)
+            self._camera_cap = cv2.VideoCapture(url)
             if not self._camera_cap.isOpened():
                 self._camera_cap.release()
                 self._camera_cap = None
@@ -262,15 +269,19 @@ class RoverAPI:
             self._camera_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self._camera_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(self.camera_timeout_s * 1000))
             self._camera_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(self.camera_timeout_s * 1000))
+            self._camera_cap_url = url
         ok, frame = self._camera_cap.read()
         if not ok or frame is None:
             return None
         return frame
 
-    def _read_snapshot_frame(self) -> Optional[np.ndarray]:
+    def _read_snapshot_frame(self, url: str) -> Optional[np.ndarray]:
         try:
-            response = requests.get(self.camera_url, timeout=self.camera_timeout_s)
+            response = requests.get(url, timeout=max(1.5, self.camera_timeout_s))
             response.raise_for_status()
+            ctype = (response.headers.get("Content-Type") or "").lower()
+            if "image" not in ctype and response.content[:2] != b"\xff\xd8":
+                return None
             image = cv2.imdecode(np.frombuffer(response.content, np.uint8), cv2.IMREAD_COLOR)
             return image
         except Exception:
@@ -312,3 +323,34 @@ class RoverAPI:
             and self._sensor_failures < max_failures
             and self._command_failures < max_failures
         )
+
+    def _camera_candidates(self) -> List[str]:
+        parsed = urlparse(self.camera_url)
+        if not parsed.scheme or not parsed.netloc:
+            return [self.camera_url]
+        root = f"{parsed.scheme}://{parsed.netloc}"
+        host = parsed.hostname or ""
+        out = [self.camera_url]
+        # Snapshot-first fallbacks for ESP32-CAM firmwares that expose /capture but not /stream.
+        out.extend(
+            [
+                f"{root}/capture",
+                f"{root}/capture?_cb=1",
+                f"{root}/stream",
+            ]
+        )
+        if host:
+            out.extend(
+                [
+                    f"{parsed.scheme}://{host}:81/stream",
+                    f"{parsed.scheme}://{host}:81/capture",
+                ]
+            )
+        # keep order + remove duplicates
+        seen = set()
+        uniq = []
+        for u in out:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+        return uniq
