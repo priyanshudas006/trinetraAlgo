@@ -1,4 +1,5 @@
 import json
+import os
 import pathlib
 import sys
 import time
@@ -7,6 +8,10 @@ import traceback
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Force deterministic simulation mode for automated flow validation.
+os.environ["DRONE_SIMULATION"] = "true"
+os.environ["ROVER_SIMULATION"] = "true"
 
 results = {
     "module_tests": {},
